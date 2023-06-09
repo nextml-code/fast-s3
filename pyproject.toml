@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "fast_s3"
-version = "0.0.0"
+version = "0.0.2"
 description = "Download images from s3 fast"
 authors = ["NextML AB"]
 readme = "README.md"

@@ -2,7 +2,9 @@ import io
 from pathlib import Path
 from typing import List, Union
 
-from .file import File
+from botocore.exceptions import ClientError
+
+from .file import File, Status
 from .transfer_manager import transfer_manager
 
 
@@ -42,10 +44,7 @@ class Fetcher:
 
         if self.ordered:
             for _ in range(len(self)):
-                file = self.files.pop(0)
-                file.future.result()
-                yield file
-                self.queue_download_()
+                yield self.process_index(0)
         else:
             for _ in range(len(self)):
                 for index, file in enumerate(self.files):
@@ -53,10 +52,16 @@ class Fetcher:
                         break
                 else:
                     index = 0
-                file = self.files.pop(index)
-                file.future.result()
-                yield file
-                self.queue_download_()
+                yield self.process_index(index)
+
+    def process_index(self, index):
+        file = self.files.pop(index)
+        self.queue_download_()
+        try:
+            file.future.result()
+            return file.with_status(Status.done)
+        except ClientError:
+            return file.with_status(Status.error)
 
     def queue_download_(self):
         if self.current_path_index < len(self):

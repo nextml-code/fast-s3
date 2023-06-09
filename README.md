@@ -12,7 +12,7 @@ Download image files
 
 ```python
 from PIL import Image
-from fast_s3 import Fetcher
+from fast_s3 import Fetcher, Status
 
 
 large_list_of_image_paths = [...]
@@ -30,7 +30,8 @@ fetcher = Fetcher(
 )
 
 for file in fetcher:
-    Image.open(file.buffer).save(file.path)
+    if file.status != Status.error:
+        Image.open(file.buffer).save(file.path)
 
 fetcher.close()
 ```
