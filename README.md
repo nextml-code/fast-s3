@@ -31,6 +31,8 @@ fetcher = Fetcher(
 
 for file in fetcher:
     Image.open(file.buffer).save(file.path)
+
+fetcher.close()
 ```
 
 Upload files
@@ -51,7 +53,9 @@ uploader = Uploader(
 )
 
 uploader.upload_files(
-    large_list_of_files,
-    large_list_of_paths,
+    source=large_list_of_files,
+    destination=large_list_of_paths,
 )
+uploader.await_futures()
+uploader.close()
 ```
