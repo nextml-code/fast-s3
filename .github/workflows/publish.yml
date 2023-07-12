@@ -1,0 +1,34 @@
+name: Publish
+
+on:
+  release:
+    types: [created]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set PATH
+        run: echo "${HOME}/.local/bin" >> $GITHUB_PATH
+
+      - uses: actions/checkout@v2
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: "3.8"
+      - name: Install dependencies
+        run: |
+          curl -sSL https://install.python-poetry.org | python - --version 1.4.2
+          poetry install
+
+      - name: Build wheels
+        run: |
+          poetry version $(git tag --points-at HEAD)
+          poetry build
+
+      - name: Upload
+        env:
+          USERNAME: __token__
+          PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          poetry publish --username=$USERNAME --password=$PASSWORD
