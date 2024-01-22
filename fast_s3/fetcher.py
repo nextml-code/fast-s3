@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import List, Union
 
 from botocore.exceptions import ClientError
+from s3transfer.exceptions import RetriesExceededError
 
 from .file import File, Status
 from .transfer_manager import transfer_manager
@@ -20,6 +21,7 @@ class Fetcher:
         ordered=True,
         buffer_size=1024,
         n_workers=32,
+        **transfer_manager_kwargs,
     ):
         self.paths = paths
         self.ordered = ordered
@@ -30,6 +32,7 @@ class Fetcher:
             aws_secret_access_key=aws_secret_access_key,
             region_name=region_name,
             n_workers=n_workers,
+            **transfer_manager_kwargs,
         )
         self.bucket_name = bucket_name
         self.files: List[File] = []
@@ -60,8 +63,8 @@ class Fetcher:
         try:
             file.future.result()
             return file.with_status(Status.done)
-        except ClientError:
-            return file.with_status(Status.error)
+        except (ClientError, RetriesExceededError) as e:
+            return file.with_status(Status.error, exception=e)
 
     def queue_download_(self):
         if self.current_path_index < len(self):

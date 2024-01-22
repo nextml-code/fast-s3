@@ -10,6 +10,7 @@ def transfer_manager(
     aws_secret_access_key: str,
     region_name: str,
     n_workers=32,
+    **kwargs,
 ) -> TransferManager:
     session = boto3.Session(
         aws_access_key_id=aws_access_key_id,
@@ -22,6 +23,6 @@ def transfer_manager(
         config=botocore.config.Config(max_pool_connections=n_workers),
     )
     transfer_config = s3transfer.TransferConfig(
-        use_threads=True, max_concurrency=n_workers
+        use_threads=True, max_concurrency=n_workers, **kwargs
     )
     return s3transfer.create_transfer_manager(client, transfer_config)

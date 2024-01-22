@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List, Tuple, Union
+from typing import List, Union
 
 from s3transfer.futures import TransferFuture
 
@@ -15,6 +15,7 @@ class Uploader:
         region_name: str,
         bucket_name: str,
         n_workers=32,
+        **transfer_manager_kwargs,
     ):
         self.transfer_manager = transfer_manager(
             endpoint_url=endpoint_url,
@@ -22,6 +23,7 @@ class Uploader:
             aws_secret_access_key=aws_secret_access_key,
             region_name=region_name,
             n_workers=n_workers,
+            **transfer_manager_kwargs,
         )
         self.bucket_name = bucket_name
         self.futures: List[TransferFuture] = []
