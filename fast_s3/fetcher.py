@@ -2,9 +2,6 @@ import io
 from pathlib import Path
 from typing import List, Union
 
-from botocore.exceptions import ClientError
-from s3transfer.exceptions import RetriesExceededError
-
 from .file import File, Status
 from .transfer_manager import transfer_manager
 
@@ -63,7 +60,7 @@ class Fetcher:
         try:
             file.future.result()
             return file.with_status(Status.done)
-        except (ClientError, RetriesExceededError) as e:
+        except Exception as e:
             return file.with_status(Status.error, exception=e)
 
     def queue_download_(self):
