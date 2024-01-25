@@ -53,10 +53,10 @@ uploader = Uploader(
     bucket_name="my-bucket",
 )
 
-uploader.upload_files(
+uploader.queue_upload(
     source=large_list_of_files,
     destination=large_list_of_paths,
 )
-uploader.await_futures()
+uploader.await_upload()
 uploader.close()
 ```

@@ -1,9 +1,24 @@
+from enum import Enum
 from pathlib import Path
-from typing import List, Union
+from typing import List, Optional, Union
 
+from pydantic import BaseModel
 from s3transfer.futures import TransferFuture
 
 from .transfer_manager import transfer_manager
+
+
+class Status(str, Enum):
+    done = "done"
+    error = "error"
+
+
+class Result(BaseModel):
+    status: Status
+    exception: Optional[Exception] = None
+
+    class Config:
+        arbitrary_types_allowed = True
 
 
 class Uploader:
@@ -28,7 +43,7 @@ class Uploader:
         self.bucket_name = bucket_name
         self.futures: List[TransferFuture] = []
 
-    def upload_files(
+    def queue_upload(
         self,
         source: List[Union[str, bytes]],
         destination: List[Union[str, Path]],
@@ -46,10 +61,16 @@ class Uploader:
                 )
             )
 
-    def await_futures(self):
+    def await_upload(self):
+        results = []
         for future in self.futures:
-            future.result()
+            try:
+                future.result()
+                results.append(Result(status=Status.done))
+            except Exception as e:
+                results.append(Result(status=Status.error, exception=e))
         self.futures = []
+        return results
 
     def close(self):
         self.transfer_manager.shutdown()
