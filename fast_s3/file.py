@@ -13,17 +13,14 @@ class Status(str, Enum):
     error = "error"
 
 
-class File(BaseModel):
+class File(BaseModel, arbitrary_types_allowed=True):
     buffer: io.BytesIO
     future: TransferFuture
     path: Union[str, Path]
     status: Status = Status.pending
     exception: Optional[Exception] = None
 
-    class Config:
-        arbitrary_types_allowed = True
-
     def with_status(self, status: Status, exception: Optional[Exception] = None):
-        attributes = self.dict()
+        attributes = dict(self)
         attributes.update(status=status, exception=exception)
         return File(**attributes)

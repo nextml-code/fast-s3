@@ -26,7 +26,7 @@ packages = [
 [tool.poetry.dependencies]
 python = "^3.8,<3.11"
 boto3 = "^1.22.13"
-pydantic = "^1.10.9"
+pydantic = "2.*.*"
 
 [tool.poetry.dev-dependencies]
 Pillow = "^9.0.0"
@@ -40,6 +40,9 @@ notebook = "^5.7.8"
 jupyter_contrib_nbextensions = "^0.5.1"
 ipykernel = "^5.4.3"
 ipywidgets = "^7.6.3"
+
+[tool.poetry.group.dev.dependencies]
+pydantic-settings = "^2.2.1"
 
 [tool.isort]
 skip = ["__init__.py"]

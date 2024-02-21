@@ -13,12 +13,9 @@ class Status(str, Enum):
     error = "error"
 
 
-class Result(BaseModel):
+class Result(BaseModel, arbitrary_types_allowed=True):
     status: Status
     exception: Optional[Exception] = None
-
-    class Config:
-        arbitrary_types_allowed = True
 
 
 class Uploader:
