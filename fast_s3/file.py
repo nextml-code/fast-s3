@@ -1,23 +1,19 @@
-import io
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from pydantic import BaseModel
-from s3transfer.futures import TransferFuture
 
 
 class Status(str, Enum):
-    pending = "pending"
-    done = "done"
-    error = "error"
+    succeeded = "succeeded"
+    failed = "failed"
 
 
 class File(BaseModel, arbitrary_types_allowed=True):
-    buffer: io.BytesIO
-    future: TransferFuture
+    content: Any
     path: Union[str, Path]
-    status: Status = Status.pending
+    status: Status
     exception: Optional[Exception] = None
 
     def with_status(self, status: Status, exception: Optional[Exception] = None):
