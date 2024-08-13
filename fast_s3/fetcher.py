@@ -1,9 +1,12 @@
-import io
+import multiprocessing
+import warnings
 from pathlib import Path
-from typing import List, Union
+from queue import Empty
+from typing import Generator, List, Tuple, Union
+
+import boto3
 
 from .file import File, Status
-from .transfer_manager import transfer_manager
 
 
 class Fetcher:
@@ -15,70 +18,96 @@ class Fetcher:
         aws_secret_access_key: str,
         region_name: str,
         bucket_name: str,
-        ordered=True,
-        buffer_size=1024,
+        buffer_size: int = 1000,
         n_workers=32,
-        **transfer_manager_kwargs,
+        worker_batch_size=100,
+        callback=lambda x: x,
+        ordered: bool = False,
     ):
-        self.paths = paths
-        self.ordered = ordered
-        self.buffer_size = buffer_size
-        self.transfer_manager = transfer_manager(
-            endpoint_url=endpoint_url,
-            aws_access_key_id=aws_access_key_id,
-            aws_secret_access_key=aws_secret_access_key,
-            region_name=region_name,
-            n_workers=n_workers,
-            **transfer_manager_kwargs,
-        )
+        self.paths = multiprocessing.Manager().list(list(enumerate(paths))[::-1])
         self.bucket_name = bucket_name
-        self.files: List[File] = []
-        self.current_path_index = 0
+        self.endpoint_url = endpoint_url
+        self.aws_access_key_id = aws_access_key_id
+        self.aws_secret_access_key = aws_secret_access_key
+        self.region_name = region_name
+        self.n_workers = n_workers
+        self.buffer_size = min(buffer_size, len(paths))
+        self.worker_batch_size = worker_batch_size
+        self.ordered = ordered
+        self.callback = callback
+
+        if ordered:
+            # TODO: fix this issue
+            warnings.warn(
+                "buffer_size is ignored when ordered=True which can cause out of memory"
+            )
+            self.results = multiprocessing.Manager().dict()
+            self.result_order = multiprocessing.Manager().list(range(len(paths)))
+        else:
+            self.file_queue = multiprocessing.Queue(maxsize=buffer_size)
+
+    def _create_s3_client(self):
+        return boto3.client(
+            "s3",
+            endpoint_url=self.endpoint_url,
+            aws_access_key_id=self.aws_access_key_id,
+            aws_secret_access_key=self.aws_secret_access_key,
+            region_name=self.region_name,
+        )
+
+    def download_batch(self, batch: List[Tuple[int, Union[Path, str]]]):
+        client = self._create_s3_client()
+        for index, path in batch:
+            try:
+                file = File(
+                    content=self.callback(
+                        client.get_object(Bucket=self.bucket_name, Key=str(path))[
+                            "Body"
+                        ].read()
+                    ),
+                    path=path,
+                    status=Status.succeeded,
+                )
+            except Exception as e:
+                file = File(content=None, path=path, status=Status.failed, exception=e)
+            if self.ordered:
+                self.results[index] = file
+            else:
+                self.file_queue.put(file)
+
+    def _worker(self):
+        while len(self.paths) > 0:
+            batch = []
+            for _ in range(min(self.worker_batch_size, len(self.paths))):
+                try:
+                    index, path = self.paths.pop()
+                    batch.append((index, path))
+                except IndexError:
+                    break
+            if len(batch) > 0:
+                self.download_batch(batch)
+
+    def __iter__(self) -> Generator[File, None, None]:
+        workers = []
+        for _ in range(self.n_workers):
+            worker_process = multiprocessing.Process(target=self._worker)
+            worker_process.start()
+            workers.append(worker_process)
+
+        if self.ordered:
+            for i in self.result_order:
+                while any(p.is_alive() for p in workers) and i not in self.results:
+                    continue  # wait for the item to appear
+                yield self.results.pop(i)
+        else:
+            while any(p.is_alive() for p in workers) or not self.file_queue.empty():
+                try:
+                    yield self.file_queue.get(timeout=1)
+                except Empty:
+                    pass
+
+        for worker in workers:
+            worker.join()
 
     def __len__(self):
         return len(self.paths)
-
-    def __iter__(self):
-        for _ in range(self.buffer_size):
-            self.queue_download_()
-
-        if self.ordered:
-            for _ in range(len(self)):
-                yield self.process_index(0)
-        else:
-            for _ in range(len(self)):
-                for index, file in enumerate(self.files):
-                    if file.future.done():
-                        break
-                else:
-                    index = 0
-                yield self.process_index(index)
-
-    def process_index(self, index):
-        file = self.files.pop(index)
-        self.queue_download_()
-        try:
-            file.future.result()
-            return file.with_status(Status.done)
-        except Exception as e:
-            return file.with_status(Status.error, exception=e)
-
-    def queue_download_(self):
-        if self.current_path_index < len(self):
-            buffer = io.BytesIO()
-            path = self.paths[self.current_path_index]
-            self.files.append(
-                File(
-                    buffer=buffer,
-                    future=self.transfer_manager.download(
-                        fileobj=buffer,
-                        bucket=self.bucket_name,
-                        key=str(path),
-                    ),
-                    path=path,
-                )
-            )
-            self.current_path_index += 1
-
-    def close(self):
-        self.transfer_manager.shutdown()
