@@ -1,10 +1,13 @@
 import multiprocessing
+import random
+import time
 import warnings
 from pathlib import Path
 from queue import Empty
-from typing import Generator, List, Tuple, Union
+from typing import Callable, Generator, List, Tuple, Union
 
 import boto3
+import botocore.exceptions
 
 from .file import File, Status
 
@@ -18,10 +21,13 @@ class Fetcher:
         aws_secret_access_key: str,
         region_name: str,
         bucket_name: str,
-        buffer_size: int = 1000,
-        n_workers=32,
-        worker_batch_size=100,
-        callback=lambda x: x,
+        buffer_size: int = 1024,
+        n_workers: int = 32,
+        worker_batch_size: int = 128,
+        n_retries: int = 3,
+        backoff_factor: float = 0.5,
+        verbose: bool = False,
+        callback: Callable = lambda x: x,
         ordered: bool = False,
     ):
         self.paths = multiprocessing.Manager().list(list(enumerate(paths))[::-1])
@@ -33,6 +39,9 @@ class Fetcher:
         self.n_workers = n_workers
         self.buffer_size = min(buffer_size, len(paths))
         self.worker_batch_size = worker_batch_size
+        self.n_retries = n_retries
+        self.backoff_factor = backoff_factor
+        self.verbose = verbose
         self.ordered = ordered
         self.callback = callback
 
@@ -58,18 +67,41 @@ class Fetcher:
     def download_batch(self, batch: List[Tuple[int, Union[Path, str]]]):
         client = self._create_s3_client()
         for index, path in batch:
-            try:
-                file = File(
-                    content=self.callback(
-                        client.get_object(Bucket=self.bucket_name, Key=str(path))[
-                            "Body"
-                        ].read()
-                    ),
-                    path=path,
-                    status=Status.succeeded,
-                )
-            except Exception as e:
-                file = File(content=None, path=path, status=Status.failed, exception=e)
+            for attempt in range(self.n_retries):
+                try:
+                    file = File(
+                        content=self.callback(
+                            client.get_object(Bucket=self.bucket_name, Key=str(path))[
+                                "Body"
+                            ].read()
+                        ),
+                        path=path,
+                        status=Status.succeeded,
+                    )
+                    break
+                except (
+                    botocore.exceptions.EndpointConnectionError,
+                    botocore.exceptions.NoCredentialsError,
+                    botocore.exceptions.PartialCredentialsError,
+                    botocore.exceptions.SSLError,
+                    botocore.exceptions.ClientError,
+                    botocore.exceptions.BotoCoreError,
+                    ConnectionError,
+                ) as e:
+                    wait_time = self.backoff_factor * (2**attempt) + random.uniform(
+                        0, 1
+                    )
+                    if self.verbose:
+                        print(
+                            f"Retrying {path} due to: {e}. Waiting {wait_time:.2f} seconds before retrying..."
+                        )
+                    time.sleep(wait_time)
+                    file = File(
+                        content=None, path=path, status=Status.failed, exception=e
+                    )
+            else:
+                if self.verbose:
+                    print(f"Failed to download {path} after {self.n_retries} retries")
             if self.ordered:
                 self.results[index] = file
             else:
