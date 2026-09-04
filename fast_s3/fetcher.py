@@ -1,18 +1,47 @@
-import multiprocessing
-import random
-import time
+import asyncio
+import logging
+import os
+import queue
 import warnings
+from concurrent.futures import Executor, ThreadPoolExecutor
 from pathlib import Path
-from queue import Empty
-from typing import Callable, Generator, List, Tuple, Union
+from typing import Callable, Dict, Generator, List, Optional, Union
 
-import boto3
-import botocore.exceptions
-
+from ._client import AsyncS3Client
+from ._loop import LoopThread
 from .file import File, Status
+
+logger = logging.getLogger("fast_s3")
+
+
+class _Crash:
+    def __init__(self, exception: BaseException):
+        self.exception = exception
 
 
 class Fetcher:
+    """Download many objects concurrently and iterate over them as they arrive.
+
+    All downloads run on a single asyncio event loop in a background thread,
+    with up to ``concurrency`` HTTP requests in flight. At most ``buffer_size``
+    files are downloaded ahead of the consumer (in flight or waiting to be
+    yielded), in both ordered and unordered mode, which bounds memory use.
+
+    In ordered mode a single slow object blocks everything behind it, and
+    downloads stop once ``buffer_size`` files are waiting behind it. Some S3
+    services occasionally serve an object in seconds rather than milliseconds,
+    so ordered mode defaults to a much larger window (32 x concurrency, versus
+    4 x concurrency unordered). Raise ``buffer_size`` further to trade memory
+    for throughput, or use unordered mode when order does not matter.
+
+    Slow requests are hedged (see ``AsyncS3Client``) so that a single straggler
+    does not stall ordered iteration; set ``hedge=False`` to disable.
+
+    ``callback`` is applied to the raw bytes of each file before it is
+    yielded. It runs in ``callback_executor`` (a thread pool by default; pass a
+    ``ProcessPoolExecutor`` for CPU heavy pure-Python callbacks).
+    """
+
     def __init__(
         self,
         paths: List[Union[str, Path]],
@@ -21,125 +50,154 @@ class Fetcher:
         aws_secret_access_key: str,
         region_name: str,
         bucket_name: str,
-        buffer_size: int = 1024,
-        n_workers: int = 32,
-        worker_batch_size: int = 128,
+        buffer_size: Optional[int] = None,
+        concurrency: int = 256,
         n_retries: int = 3,
         backoff_factor: float = 0.5,
         verbose: bool = False,
-        callback: Callable = lambda x: x,
+        callback: Optional[Callable] = None,
         ordered: bool = False,
+        callback_executor: Optional[Executor] = None,
+        addressing_style: str = "auto",
+        verify_ssl: bool = True,
+        hedge: Union[bool, float] = True,
+        n_workers: Optional[int] = None,
     ):
-        self.paths = multiprocessing.Manager().list(list(enumerate(paths))[::-1])
-        self.bucket_name = bucket_name
+        if n_workers is not None:
+            warnings.warn(
+                "n_workers is deprecated, use concurrency",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            concurrency = n_workers
+        self.paths = list(paths)
         self.endpoint_url = endpoint_url
         self.aws_access_key_id = aws_access_key_id
         self.aws_secret_access_key = aws_secret_access_key
         self.region_name = region_name
-        self.n_workers = n_workers
-        self.buffer_size = min(buffer_size, len(paths))
-        self.worker_batch_size = worker_batch_size
+        self.bucket_name = bucket_name
+        self.concurrency = max(1, concurrency)
+        if buffer_size is None:
+            buffer_size = 32 * self.concurrency if ordered else 4 * self.concurrency
+        self.buffer_size = max(1, buffer_size)
+        if self.buffer_size < self.concurrency:
+            warnings.warn(
+                f"buffer_size={self.buffer_size} < concurrency={self.concurrency}: "
+                "effective concurrency is limited by buffer_size",
+                stacklevel=2,
+            )
         self.n_retries = n_retries
         self.backoff_factor = backoff_factor
-        self.verbose = verbose
-        self.ordered = ordered
         self.callback = callback
+        self.ordered = ordered
+        self.addressing_style = addressing_style
+        self.verify_ssl = verify_ssl
+        self.hedge = hedge
+        self._executor = callback_executor
+        self._own_executor = callback_executor is None and callback is not None
+        if verbose:
+            _enable_verbose_logging()
 
-        if ordered:
-            # TODO: fix this issue
-            warnings.warn(
-                "buffer_size is ignored when ordered=True which can cause out of memory"
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __iter__(self) -> Generator[File, None, None]:
+        out: "queue.Queue" = queue.Queue()
+        loop_thread = LoopThread()
+        loop_thread.start()
+        slots: Optional[asyncio.Semaphore] = None
+        executor = self._executor
+        if self._own_executor:
+            executor = ThreadPoolExecutor(
+                min(32, (os.cpu_count() or 4) + 4), thread_name_prefix="fast-s3-cb"
             )
-            self.results = multiprocessing.Manager().dict()
-            self.result_order = multiprocessing.Manager().list(range(len(paths)))
-        else:
-            self.file_queue = multiprocessing.Queue(maxsize=buffer_size)
 
-    def _create_s3_client(self):
-        return boto3.client(
-            "s3",
-            endpoint_url=self.endpoint_url,
-            aws_access_key_id=self.aws_access_key_id,
-            aws_secret_access_key=self.aws_secret_access_key,
-            region_name=self.region_name,
-        )
+        async def main() -> None:
+            nonlocal slots
+            slots = asyncio.Semaphore(self.buffer_size)
+            limiter = asyncio.Semaphore(self.concurrency)
+            loop = asyncio.get_running_loop()
+            pending: Dict[int, File] = {}
+            next_index = 0
 
-    def download_batch(self, batch: List[Tuple[int, Union[Path, str]]]):
-        client = self._create_s3_client()
-        for index, path in batch:
-            for attempt in range(self.n_retries):
+            def deliver(index: int, file: File) -> None:
+                nonlocal next_index
+                if not self.ordered:
+                    out.put(file)
+                    return
+                pending[index] = file
+                while next_index in pending:
+                    out.put(pending.pop(next_index))
+                    next_index += 1
+
+            async def fetch_one(
+                client: AsyncS3Client, index: int, path: Union[str, Path]
+            ) -> None:
                 try:
-                    file = File(
-                        content=self.callback(
-                            client.get_object(Bucket=self.bucket_name, Key=str(path))[
-                                "Body"
-                            ].read()
-                        ),
-                        path=path,
-                        status=Status.succeeded,
-                    )
-                    break
-                except (
-                    botocore.exceptions.EndpointConnectionError,
-                    botocore.exceptions.NoCredentialsError,
-                    botocore.exceptions.PartialCredentialsError,
-                    botocore.exceptions.SSLError,
-                    botocore.exceptions.ClientError,
-                    botocore.exceptions.BotoCoreError,
-                    ConnectionError,
-                ) as e:
-                    wait_time = self.backoff_factor * (2**attempt) + random.uniform(
-                        0, 1
-                    )
-                    if self.verbose:
-                        print(
-                            f"Retrying {path} due to: {e}. Waiting {wait_time:.2f} seconds before retrying..."
+                    async with limiter:
+                        data = await client.get_object(str(path))
+                    if self.callback is not None:
+                        content = await loop.run_in_executor(
+                            executor, self.callback, data
                         )
-                    time.sleep(wait_time)
+                    else:
+                        content = data
+                    file = File(content=content, path=path, status=Status.succeeded)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning("Failed to download %s: %r", path, e)
                     file = File(
                         content=None, path=path, status=Status.failed, exception=e
                     )
-            else:
-                if self.verbose:
-                    print(f"Failed to download {path} after {self.n_retries} retries")
-            if self.ordered:
-                self.results[index] = file
-            else:
-                self.file_queue.put(file)
+                deliver(index, file)
 
-    def _worker(self):
-        while len(self.paths) > 0:
-            batch = []
-            for _ in range(min(self.worker_batch_size, len(self.paths))):
-                try:
-                    index, path = self.paths.pop()
-                    batch.append((index, path))
-                except IndexError:
-                    break
-            if len(batch) > 0:
-                self.download_batch(batch)
+            async with AsyncS3Client(
+                endpoint_url=self.endpoint_url,
+                access_key=self.aws_access_key_id,
+                secret_key=self.aws_secret_access_key,
+                region=self.region_name,
+                bucket=self.bucket_name,
+                max_connections=self.concurrency,
+                n_retries=self.n_retries,
+                backoff_factor=self.backoff_factor,
+                addressing_style=self.addressing_style,
+                verify_ssl=self.verify_ssl,
+                hedge=self.hedge,
+            ) as client:
+                tasks = []
+                for index, path in enumerate(self.paths):
+                    await slots.acquire()
+                    tasks.append(asyncio.create_task(fetch_one(client, index, path)))
+                    tasks = [t for t in tasks if not t.done()]
+                await asyncio.gather(*tasks)
 
-    def __iter__(self) -> Generator[File, None, None]:
-        workers = []
-        for _ in range(self.n_workers):
-            worker_process = multiprocessing.Process(target=self._worker)
-            worker_process.start()
-            workers.append(worker_process)
+        def runner_done(future) -> None:
+            if not future.cancelled() and future.exception() is not None:
+                out.put(_Crash(future.exception()))
 
-        if self.ordered:
-            for i in self.result_order:
-                while any(p.is_alive() for p in workers) and i not in self.results:
-                    continue  # wait for the item to appear
-                yield self.results.pop(i)
-        else:
-            while any(p.is_alive() for p in workers) or not self.file_queue.empty():
-                try:
-                    yield self.file_queue.get(timeout=1)
-                except Empty:
-                    pass
+        runner = loop_thread.submit(main())
+        runner.add_done_callback(runner_done)
+        try:
+            for _ in range(len(self.paths)):
+                item = out.get()
+                if isinstance(item, _Crash):
+                    raise item.exception
+                loop_thread.loop.call_soon_threadsafe(slots.release)
+                yield item
+        finally:
+            runner.cancel()
+            loop_thread.stop()
+            if self._own_executor and executor is not None:
+                executor.shutdown(wait=False)
 
-        for worker in workers:
-            worker.join()
+    def close(self) -> None:
+        """Kept for backwards compatibility; resources are released when iteration ends."""
 
-    def __len__(self):
-        return len(self.paths)
+
+def _enable_verbose_logging() -> None:
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(name)s %(levelname)s: %(message)s"))
+        logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
